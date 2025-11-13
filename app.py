@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import whisper
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -29,6 +30,17 @@ ALLOWED_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac'}
 ALLOWED_DOMAINS = None  # Set to list of domains to restrict, e.g., ['example.com']
 
 app = FastAPI(title="Audio to PDF API")
+
+# ------------------------------
+# CORS Configuration - THIS IS THE FIX
+# ------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your actual frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ------------------------------
 # Helper Functions
