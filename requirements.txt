@@ -10,7 +10,7 @@ openai-whisper==20231117
 torch==2.5.1
 torchaudio==2.5.1
 
-# OpenAI API
+
 openai==1.54.5
 
 # PDF Generation
