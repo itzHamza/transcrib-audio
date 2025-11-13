@@ -5,12 +5,13 @@ uvicorn[standard]==0.32.1
 # HTTP Requests
 requests==2.32.3
 
-# Audio Processing
+# Audio Processing - Using CPU-only versions to avoid triton conflicts
 openai-whisper==20231117
-torch==2.5.1
-torchaudio==2.5.1
+torch==2.5.1+cpu
+torchaudio==2.5.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-
+# OpenAI API
 openai==1.54.5
 
 # PDF Generation
