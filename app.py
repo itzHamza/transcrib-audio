@@ -8,23 +8,23 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import whisper
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from openai import OpenAI
+from groq import Groq
 
 # ------------------------------
 # Configuration
 # ------------------------------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-whisper_model = whisper.load_model("base")
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # Limits
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-CHUNK_LENGTH = 600  # 10 minutes
+CHUNK_LENGTH = 600  # 10 minutes (Groq has 25MB file size limit per request)
 MAX_TEXT_BEFORE_SUMMARY = 4000
 ALLOWED_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac'}
 ALLOWED_DOMAINS = None  # Set to list of domains to restrict, e.g., ['example.com']
@@ -32,7 +32,7 @@ ALLOWED_DOMAINS = None  # Set to list of domains to restrict, e.g., ['example.co
 app = FastAPI(title="Audio to PDF API")
 
 # ------------------------------
-# CORS Configuration - THIS IS THE FIX
+# CORS Configuration
 # ------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -148,6 +148,29 @@ def split_audio(input_file: str, chunk_length=CHUNK_LENGTH) -> list:
         raise AudioProcessingError("Audio splitting timed out")
 
 
+def transcribe_with_groq(audio_file: str) -> str:
+    """Transcribe audio using Groq's Whisper API (ultra-fast)"""
+    try:
+        # Check file size (Groq has 25MB limit per file)
+        file_size = os.path.getsize(audio_file)
+        if file_size > 25 * 1024 * 1024:
+            raise AudioProcessingError(f"Chunk too large for Groq API (max 25MB, got {file_size/1024/1024:.1f}MB)")
+        
+        with open(audio_file, "rb") as file:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(Path(audio_file).name, file.read()),
+                model="whisper-large-v3",
+                response_format="text",
+                language="en",  # Specify language for better accuracy (remove if multi-language)
+                temperature=0.0  # Deterministic output
+            )
+        
+        return transcription.strip()
+    
+    except Exception as e:
+        raise AudioProcessingError(f"Groq transcription failed: {str(e)}")
+
+
 def summarize_text(text: str) -> str:
     """Summarize text using GPT-4o-mini with error handling"""
     if not text.strip():
@@ -168,7 +191,7 @@ def summarize_text(text: str) -> str:
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
-        print(f"❌ Summarization error: {e}")
+        print(f"⚠️ Summarization error: {e}")
         # Return truncated text as fallback
         return text[:MAX_TEXT_BEFORE_SUMMARY] + "...[truncated]"
 
@@ -243,10 +266,12 @@ def cleanup_files(*file_paths):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    groq_available = bool(os.environ.get("GROQ_API_KEY"))
     return {
         "status": "healthy",
         "ffmpeg_available": check_ffmpeg(),
-        "whisper_model": "base"
+        "transcription_engine": "Groq Whisper-Large-v3",
+        "groq_configured": groq_available
     }
 
 
@@ -257,10 +282,12 @@ async def audio_to_pdf(
     summarize: bool = Query(True, description="Enable automatic summarization")
 ):
     """
-    Convert audio file to PDF transcript
+    Convert audio file to PDF transcript using Groq's ultra-fast Whisper API
     
     - **url**: Direct URL to audio file (mp3, wav, m4a, ogg, flac)
     - **summarize**: Enable automatic text summarization for long content
+    
+    Note: Groq has a 25MB per-file limit, so long audio is automatically split into chunks
     """
     audio_file = None
     chunk_files = []
@@ -268,23 +295,27 @@ async def audio_to_pdf(
     chunk_dir = None
     
     try:
+        # Validate Groq API key
+        if not os.environ.get("GROQ_API_KEY"):
+            raise AudioProcessingError("GROQ_API_KEY not configured")
+        
         # Download audio
         print(f"📥 Downloading audio from {url[:50]}...")
         audio_file = download_audio(url)
         
-        # Split into chunks
+        # Split into chunks (Groq has 25MB limit)
         print(f"✂️ Splitting audio...")
         chunk_files = split_audio(audio_file)
         chunk_dir = Path(chunk_files[0]).parent if chunk_files else None
         
-        # Process chunks
+        # Process chunks with Groq
         full_text = ""
         
         for i, chunk in enumerate(chunk_files):
-            print(f"🎧 Transcribing chunk {i+1}/{len(chunk_files)}...")
+            print(f"🎧 Transcribing chunk {i+1}/{len(chunk_files)} with Groq...")
             
-            result = whisper_model.transcribe(chunk, fp16=False)
-            chunk_text = result["text"].strip()
+            # Transcribe with Groq (ultra-fast)
+            chunk_text = transcribe_with_groq(chunk)
             
             # Summarize individual chunk if too long
             if summarize and len(chunk_text) > MAX_TEXT_BEFORE_SUMMARY:
