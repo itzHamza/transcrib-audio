@@ -15,11 +15,15 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from openai import OpenAI
 from groq import Groq
+from pytube import YouTube
 
 # ------------------------------
 # Configuration
 # ------------------------------
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+client = OpenAI(
+  base_url="https://openrouter.ai/api/v1",
+  api_key=os.environ.get("OPENAI_API_KEY"),
+)
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # Limits
@@ -101,6 +105,21 @@ def download_audio(url: str) -> str:
         raise AudioProcessingError(f"Download failed: {str(e)}")
 
 
+def download_youtube_audio(url: str) -> str:
+    """Download audio from a YouTube video"""
+    try:
+        yt = YouTube(url)
+        stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+        if not stream:
+            raise AudioProcessingError("No audio stream available")
+        
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        stream.download(filename=tmp_file.name)
+        return tmp_file.name
+    except Exception as e:
+        raise AudioProcessingError(f"YouTube download failed: {str(e)}")
+
+
 def check_ffmpeg():
     """Check if FFmpeg is available"""
     try:
@@ -171,7 +190,7 @@ def transcribe_with_groq(audio_file: str) -> str:
 
 
 def summarize_text(text: str) -> str:
-    """Summarize text using GPT-4o-mini with error handling"""
+    """Summarize text using gemini-2.5-flash-lite with error handling"""
     if not text.strip():
         return ""
     
@@ -183,7 +202,7 @@ def summarize_text(text: str) -> str:
     
     try:
         res = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="google/gemini-2.5-flash-lite",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1000,
             temperature=0.3
@@ -332,6 +351,86 @@ async def audio_to_pdf(
         pdf_path = generate_pdf(full_text)
         
         # Schedule cleanup after response
+        background_tasks.add_task(
+            cleanup_files, 
+            audio_file, 
+            pdf_path,
+            chunk_dir
+        )
+        
+        return FileResponse(
+            pdf_path,
+            filename="transcript.pdf",
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": "attachment; filename=transcript.pdf"
+            }
+        )
+    
+    except AudioProcessingError as e:
+        cleanup_files(audio_file, pdf_path, chunk_dir)
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    except Exception as e:
+        cleanup_files(audio_file, pdf_path, chunk_dir)
+        print(f"❌ Unexpected error: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Processing failed: {str(e)}"
+        )
+
+
+@app.get("/youtube-to-pdf")
+async def youtube_to_pdf(
+    background_tasks: BackgroundTasks,
+    url: str = Query(..., description="URL of the YouTube video"),
+    summarize: bool = Query(True, description="Enable automatic summarization")
+):
+    """
+    Convert a YouTube video to a PDF transcript.
+    
+    - **url**: URL of the YouTube video
+    - **summarize**: Enable automatic text summarization for long content
+    """
+    audio_file = None
+    chunk_files = []
+    pdf_path = None
+    chunk_dir = None
+    
+    try:
+        # Validate Groq API key
+        if not os.environ.get("GROQ_API_KEY"):
+            raise AudioProcessingError("GROQ_API_KEY not configured")
+        
+        # Download audio from YouTube
+        print(f"📥 Downloading audio from YouTube: {url[:50]}...")
+        audio_file = download_youtube_audio(url)
+        
+        # Split into chunks
+        print(f"✂️ Splitting audio...")
+        chunk_files = split_audio(audio_file)
+        chunk_dir = Path(chunk_files[0]).parent if chunk_files else None
+        
+        # Process chunks
+        full_text = ""
+        for i, chunk in enumerate(chunk_files):
+            print(f"🎧 Transcribing chunk {i+1}/{len(chunk_files)} with Groq...")
+            chunk_text = transcribe_with_groq(chunk)
+            
+            if summarize and len(chunk_text) > MAX_TEXT_BEFORE_SUMMARY:
+                print(f"📝 Summarizing chunk {i+1}...")
+                chunk_text = summarize_text(chunk_text)
+            
+            full_text += chunk_text + "\n\n"
+        
+        if not full_text.strip():
+            raise AudioProcessingError("No transcription generated")
+        
+        # Generate PDF
+        print(f"📄 Generating PDF...")
+        pdf_path = generate_pdf(full_text)
+        
+        # Schedule cleanup
         background_tasks.add_task(
             cleanup_files, 
             audio_file, 
