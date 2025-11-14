@@ -161,7 +161,6 @@ def transcribe_with_groq(audio_file: str) -> str:
                 file=(Path(audio_file).name, file.read()),
                 model="whisper-large-v3",
                 response_format="text",
-                language="fr",  # Specify language for better accuracy (remove if multi-language)
                 temperature=0.0  # Deterministic output
             )
         
