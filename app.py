@@ -22,7 +22,6 @@ from groq import Groq
 client = OpenAI(
   base_url="https://openrouter.ai/api/v1",
   api_key=os.environ.get("OPENROUTER_API_KEY"), 
-   # ✅ Clear name
 )
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -55,6 +54,74 @@ app.add_middleware(
 class AudioProcessingError(Exception):
     """Custom exception for audio processing errors"""
     pass
+
+
+def detect_language(text: str) -> str:
+    """
+    Detect language of the text using DetectLanguage API
+    Returns language code (e.g., 'en', 'fr', 'es', 'ar')
+    """
+    api_key = os.environ.get("DETECTLANGUAGE_API_KEY")
+    
+    if not api_key:
+        print("⚠️ DETECTLANGUAGE_API_KEY not set, defaulting to English")
+        return "en"
+    
+    try:
+        # Use first 1000 characters for detection (API may have limits)
+        sample_text = text[:1000].strip()
+        
+        if not sample_text:
+            return "en"
+        
+        response = requests.post(
+            "https://ws.detectlanguage.com/0.2/detect",
+            data={"q": sample_text},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10
+        )
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("data") and data["data"].get("detections") and len(data["data"]["detections"]) > 0:
+            detected_lang = data["data"]["detections"][0].get("language", "en")
+            confidence = data["data"]["detections"][0].get("confidence", 0)
+            print(f"🌐 Language detected: {detected_lang} (confidence: {confidence:.2f})")
+            return detected_lang
+        
+        print("⚠️ No language detected, defaulting to English")
+        return "en"
+    
+    except Exception as e:
+        print(f"⚠️ Language detection error: {e}, defaulting to English")
+        return "en"
+
+
+def get_language_name(lang_code: str) -> str:
+    """Get full language name from code"""
+    language_names = {
+        "en": "English",
+        "es": "Spanish",
+        "fr": "French",
+        "de": "German",
+        "it": "Italian",
+        "pt": "Portuguese",
+        "ru": "Russian",
+        "ja": "Japanese",
+        "zh": "Chinese",
+        "ar": "Arabic",
+        "hi": "Hindi",
+        "ko": "Korean",
+        "tr": "Turkish",
+        "nl": "Dutch",
+        "pl": "Polish",
+        "sv": "Swedish",
+        "da": "Danish",
+        "no": "Norwegian",
+        "fi": "Finnish"
+    }
+    return language_names.get(lang_code, lang_code.upper())
 
 
 def validate_url(url: str) -> bool:
@@ -224,14 +291,23 @@ def transcribe_with_groq(audio_file: str) -> str:
         raise AudioProcessingError(f"Groq transcription failed: {str(e)}")
 
 
-def summarize_text(text: str) -> str:
-    """Summarize text using gemini-2.5-flash-lite with error handling"""
+def summarize_text(text: str, language_code: str = "en") -> str:
+    """
+    Summarize text using gemini-2.5-flash-lite with language preservation
+    
+    Args:
+        text: Text to summarize
+        language_code: Detected language code (e.g., 'en', 'fr', 'ar')
+    """
     if not text.strip():
         return ""
     
+    language_name = get_language_name(language_code)
+    
     prompt = (
-        "Summarize this transcript clearly and concisely, Keep it professional, keep same language of audio, 60% of times it frensh, 40% english,  "
-        "preserving key technical/medical terms and main points:\n\n"
+        f"Summarize this transcript clearly and concisely in {language_name}. "
+        f"IMPORTANT: Your response must be ENTIRELY in {language_name}. "
+        f"Preserve key technical/medical terms and main points:\n\n"
         f"{text}"
     )
     
@@ -241,7 +317,9 @@ def summarize_text(text: str) -> str:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3
         )
-        return res.choices[0].message.content.strip()
+        summary = res.choices[0].message.content.strip()
+        print(f"📝 Summary generated in {language_name}")
+        return summary
     except Exception as e:
         print(f"⚠️ Summarization error: {e}")
         # Return truncated text as fallback
@@ -319,6 +397,7 @@ def cleanup_files(*file_paths):
 async def health_check():
     """Health check endpoint"""
     groq_available = bool(os.environ.get("GROQ_API_KEY"))
+    detect_lang_available = bool(os.environ.get("DETECTLANGUAGE_API_KEY"))
     
     # Check yt-dlp availability
     ytdlp_available = False
@@ -336,7 +415,8 @@ async def health_check():
         "ffmpeg_available": check_ffmpeg(),
         "transcription_engine": "Groq Whisper-Large-v3",
         "groq_configured": groq_available,
-        "ytdlp_available": ytdlp_available
+        "ytdlp_available": ytdlp_available,
+        "language_detection_configured": detect_lang_available
     }
 
 
@@ -358,6 +438,7 @@ async def audio_to_pdf(
     chunk_files = []
     pdf_path = None
     chunk_dir = None
+    detected_language = None
     
     try:
         # Validate Groq API key
@@ -381,12 +462,17 @@ async def audio_to_pdf(
             
             # Transcribe with Groq (ultra-fast)
             chunk_text = transcribe_with_groq(chunk)
-            print(f"📝 chunk {i+1 } : {chunk_text}  ")
+            print(f"📝 chunk {i+1}: {chunk_text[:100]}...")
             
-            # Summarize individual chunk if too long
+            # Detect language from first chunk
+            if i == 0 and chunk_text.strip():
+                detected_language = detect_language(chunk_text)
+                print(f"🌐 Detected language: {get_language_name(detected_language)}")
+            
+            # Summarize individual chunk if too long (with language preservation)
             if summarize and len(chunk_text) > MAX_TEXT_BEFORE_SUMMARY:
-                print(f"📝 Summarizing chunk {i+1}...")
-                chunk_text = summarize_text(chunk_text)
+                print(f"📄 Summarizing chunk {i+1}...")
+                chunk_text = summarize_text(chunk_text, detected_language or "en")
             
             full_text += chunk_text + "\n\n"
         
@@ -443,6 +529,7 @@ async def youtube_to_pdf(
     chunk_files = []
     pdf_path = None
     chunk_dir = None
+    detected_language = None
     
     try:
         # Validate Groq API key
@@ -464,9 +551,15 @@ async def youtube_to_pdf(
             print(f"🎧 Transcribing chunk {i+1}/{len(chunk_files)} with Groq...")
             chunk_text = transcribe_with_groq(chunk)
             
+            # Detect language from first chunk
+            if i == 0 and chunk_text.strip():
+                detected_language = detect_language(chunk_text)
+                print(f"🌐 Detected language: {get_language_name(detected_language)}")
+            
+            # Summarize with language preservation
             if summarize and len(chunk_text) > MAX_TEXT_BEFORE_SUMMARY:
-                print(f"📝 Summarizing chunk {i+1}...")
-                chunk_text = summarize_text(chunk_text)
+                print(f"📄 Summarizing chunk {i+1}...")
+                chunk_text = summarize_text(chunk_text, detected_language or "en")
             
             full_text += chunk_text + "\n\n"
         
