@@ -15,7 +15,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from openai import OpenAI
 from groq import Groq
-from pytube import YouTube
 
 # ------------------------------
 # Configuration
@@ -106,16 +105,49 @@ def download_audio(url: str) -> str:
 
 
 def download_youtube_audio(url: str) -> str:
-    """Download audio from a YouTube video"""
+    """Download audio from a YouTube video using yt-dlp (more reliable than pytube)"""
     try:
-        yt = YouTube(url)
-        stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
-        if not stream:
-            raise AudioProcessingError("No audio stream available")
+        # Check if yt-dlp is available
+        try:
+            subprocess.run(['yt-dlp', '--version'], 
+                          stdout=subprocess.DEVNULL, 
+                          stderr=subprocess.DEVNULL, 
+                          check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise AudioProcessingError("yt-dlp not installed. Install with: pip install yt-dlp")
         
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        stream.download(filename=tmp_file.name)
+        # Create temporary file
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
+        tmp_file.close()
+        
+        print(f"📹 Fetching video info...")
+        
+        # Download audio using yt-dlp
+        result = subprocess.run([
+            'yt-dlp',
+            '-f', 'bestaudio',  # Get best audio quality
+            '-x',  # Extract audio
+            '--audio-format', 'm4a',  # Convert to m4a
+            '-o', tmp_file.name,  # Output file
+            '--no-playlist',  # Don't download playlists
+            url
+        ], capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            print(f"❌ yt-dlp stderr: {result.stderr}")
+            raise AudioProcessingError(f"yt-dlp error: {result.stderr}")
+        
+        # Check if file was created
+        if not os.path.exists(tmp_file.name) or os.path.getsize(tmp_file.name) == 0:
+            raise AudioProcessingError("Failed to download YouTube audio")
+        
+        file_size = os.path.getsize(tmp_file.name)
+        print(f"✅ Downloaded: {file_size / 1024 / 1024:.2f} MB")
+        
         return tmp_file.name
+    
+    except subprocess.TimeoutExpired:
+        raise AudioProcessingError("YouTube download timed out")
     except Exception as e:
         raise AudioProcessingError(f"YouTube download failed: {str(e)}")
 
@@ -285,11 +317,24 @@ def cleanup_files(*file_paths):
 async def health_check():
     """Health check endpoint"""
     groq_available = bool(os.environ.get("GROQ_API_KEY"))
+    
+    # Check yt-dlp availability
+    ytdlp_available = False
+    try:
+        subprocess.run(['yt-dlp', '--version'], 
+                      stdout=subprocess.DEVNULL, 
+                      stderr=subprocess.DEVNULL, 
+                      check=True)
+        ytdlp_available = True
+    except:
+        pass
+    
     return {
         "status": "healthy",
         "ffmpeg_available": check_ffmpeg(),
         "transcription_engine": "Groq Whisper-Large-v3",
-        "groq_configured": groq_available
+        "groq_configured": groq_available,
+        "ytdlp_available": ytdlp_available
     }
 
 
