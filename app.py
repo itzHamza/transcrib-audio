@@ -177,7 +177,7 @@ def summarize_text(text: str) -> str:
         return ""
     
     prompt = (
-        "Summarize this transcript clearly and concisely, "
+        "Summarize this transcript clearly and concisely, Keep it professional, keep same language of audio, 60% of times it frensh, 40% english,  "
         "preserving key technical/medical terms and main points:\n\n"
         f"{text}"
     )
@@ -316,6 +316,7 @@ async def audio_to_pdf(
             
             # Transcribe with Groq (ultra-fast)
             chunk_text = transcribe_with_groq(chunk)
+            print(f"📝 chunk {i+1 } : {chunk_text}  ")
             
             # Summarize individual chunk if too long
             if summarize and len(chunk_text) > MAX_TEXT_BEFORE_SUMMARY:
