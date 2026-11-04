@@ -74,7 +74,10 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY") or "")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB raw download cap
-SAFE_TRANSCRIBE_BYTES = 60 * 1024 * 1024  # per-request budget (< Groq's current 80 MB limit, with headroom)
+SAFE_TRANSCRIBE_BYTES = 24 * 1024 * 1024
+# NOTE: Groq returns "413 Payload Too Large" well below 80MB on this plan
+# (observed live on a normalized ~30MB file) — budget stays conservative at
+# 24MB so chunk_audio() engages instead of shipping an over-limit single chunk.
 MIN_CHUNK_SECONDS = 90
 SUMMARY_SINGLE_PASS_CHARS = 60_000
 SUMMARY_MODEL = "google/gemini-2.5-flash-lite"
@@ -131,6 +134,42 @@ class ProgressReporter:
         except Exception:
             return False
         return any(host == h or host.endswith("." + h) for h in ALLOWED_CALLBACK_HOSTS)
+
+    def ping(self) -> bool:
+        """One probe POST — any HTTP response means the callback is reachable."""
+        headers = {}
+        secret = os.getenv("AUDIO_PROGRESS_SECRET")
+        if secret:
+            headers["x-audio-progress-secret"] = secret
+        try:
+            requests.post(
+                self.callback,
+                json={
+                    "job": self.job,
+                    "event": {"stage": "ping", "message": "service actif", "pct": 0},
+                },
+                headers=headers,
+                timeout=4,
+            )
+            return True
+        except Exception:
+            return False
+
+    def engage(self) -> None:
+        """Validate callback host + one-shot connectivity probe; disables noisy retries."""
+        if not self.job or not self.callback:
+            self.enabled = False
+            return
+        if not self.validate_callback():
+            log.warning("[job %s] callback host not allowed — live logs disabled", self.job[:8])
+            self.enabled = False
+            return
+        if not self.ping():
+            log.warning(
+                "[job %s] progress callback unreachable at startup — live logs disabled for this job",
+                self.job[:8],
+            )
+            self.enabled = False
 
     def emit(
         self,
@@ -312,10 +351,12 @@ async def chunk_audio(
         return [normalized_path]
 
     out_dir = tempfile.mkdtemp(prefix="chunks_")
+    # Sizing derived purely from the size ratio (with a 10% safety margin so
+    # the floor() never lands a segment over the per-request budget).
     chunk_seconds = int(
         max(
             MIN_CHUNK_SECONDS,
-            min(600, math.floor(duration * (SAFE_TRANSCRIBE_BYTES / size))),
+            min(1800, math.floor(duration * (SAFE_TRANSCRIBE_BYTES / size) * 0.9)),
         )
     )
     output_pattern = str(Path(out_dir) / "part_%03d.mp3")
@@ -679,9 +720,7 @@ async def process_audio_pipeline(
     """Full pipeline; returns (pdf_path, filename, detected_language, cleanup_paths)."""
     started = time.time()
     progress = ProgressReporter(job, callback)
-    if progress.enabled and not progress.validate_callback():
-        log.warning("[job %s] callback host not allowed — live logs disabled", progress.job[:8])
-        progress.enabled = False
+    progress.engage()
 
     suffix = validate_url(url)
     progress.emit("download", "Téléchargement de l'audio…", pct=5)
@@ -787,12 +826,7 @@ async def youtube_to_pdf(
     job: Optional[str] = None,
 ):
     progress = ProgressReporter(job, None)
-    if progress.job:
-        if progress.validate_callback():
-            progress.enabled = True
-        else:
-            log.warning("[job %s] callback host not allowed — live logs disabled", progress.job[:8])
-            progress.enabled = False
+    progress.engage()
     def _yt_download() -> Tuple[str, Dict[str, Any]]:
         out_dir = tempfile.mkdtemp(prefix="yt_")
         template = str(Path(out_dir) / "yt.%(ext)s")
