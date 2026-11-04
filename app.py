@@ -615,6 +615,19 @@ def _register_unicode_fonts() -> None:
                     pdfmetrics.registerFont(TTFont("Unicode", font_path))
                     log.info("registered Unicode PDF font: %s", font_path)
                     FONT_CONF["regular"] = {"name": "Unicode", "arabic": True}
+                    # Optional bold companion for markdown headings / bold runs
+                    bold_candidates = [
+                        str(Path(font_path).with_name(Path(font_path).stem + "-Bold.ttf")),
+                        str(Path(font_path).with_name(Path(font_path).stem.replace("Sans", "Sans-Bold") + ".ttf")),
+                    ]
+                    for bold_path in bold_candidates:
+                        if os.path.isfile(bold_path):
+                            try:
+                                pdfmetrics.registerFont(TTFont("Unicode-Bold", bold_path))
+                                log.info("registered bold PDF font: %s", bold_path)
+                                break
+                            except Exception as exc:
+                                log.warning("bold font load failed: %s | %s", bold_path, exc)
                     return
                 except Exception as exc:
                     log.warning("font load failed: %s | %s", font_path, exc)
@@ -675,6 +688,63 @@ def _wrap_lines(
     return out
 
 
+_ARABIC_RANGE = ARABIC_RANGE
+
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+_MD_BULLET_RE = re.compile(r"^([-*•])\s+(.*)$")
+_MD_ORDERED_RE = re.compile(r"^(\d{1,3})[.)]\s+(.*)$")
+_MD_RULE_RE = re.compile(r"^(-{3,}|\*{3,})$")
+_PREAMBLE_RE = re.compile(r"^(voici|ci-dessous|ci-après)\b", re.I)
+
+
+def _strip_md_emphasis(text: str) -> str:
+    """Remove **bold** / *italic* markers, keep the words."""
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", text)
+    return text
+
+
+def _md_to_pdf_lines(text: str) -> List[str]:
+    """
+    Pragmatic markdown-lite for the PDF:
+      - `## Title`        → heading marker line (##ND##…, drawn prominent)
+      - `- item` / `* item` → "• item"
+      - "1. item"         → kept as "1. item"
+      - `---` rules       → blank separator
+      - **bold**/*italic* → plain text
+    """
+    out: List[str] = []
+    for raw in text.split("\n"):
+        s = raw.strip()
+        if not s:
+            out.append("")
+            continue
+        if _MD_RULE_RE.match(s):
+            out.append("")
+            continue
+        m = _MD_HEADING_RE.match(s)
+        if m:
+            out.append("##ND##" + _strip_md_emphasis(m.group(1)).strip())
+            continue
+        m = _MD_BULLET_RE.match(s)
+        if m:
+            out.append("• " + _strip_md_emphasis(m.group(2)).strip())
+            continue
+        m = _MD_ORDERED_RE.match(s)
+        if m:
+            out.append(f"{m.group(1)}. {_strip_md_emphasis(m.group(2)).strip()}")
+            continue
+        out.append(_strip_md_emphasis(s))
+    # Drop a first line that is meta-commentary ("Voici une synthèse…")
+    for i, line in enumerate(out):
+        if line and not line.startswith("##ND##"):
+            if _PREAMBLE_RE.match(line) and line.rstrip().endswith(":"):
+                del out[i]
+                break
+            break
+    return out
+
+
 def generate_pdf(
     full_text: str,
     summary: str,
@@ -727,10 +797,30 @@ def generate_pdf(
     c.drawString(left, y, meta)
     y -= 18
 
-    # Summary section
+    # Summary section — markdown-lite preprocessed into block stream
     if summary:
         heading("Synthèse détaillée", size=13)
-        draw_wrapped(summary, size=11)
+        for line in _md_to_pdf_lines(summary):
+            s = line.strip()
+            if not s:
+                y -= 4
+                continue
+            if s.startswith("##ND##"):
+                if y < 30 * mm:
+                    new_page()
+                    y = top
+                display = _shape_text(s[6:])
+                f = (
+                    "Unicode-Bold"
+                    if "Unicode-Bold" in pdfmetrics.getRegisteredFontNames()
+                    else font_name
+                )
+                c.setFont(f, 12)
+                c.drawString(left, y, display)
+                y -= 12 * 1.5
+                y -= 2
+                continue
+            draw_wrapped(s, size=11, gap_after=2)
         if y < 60 * mm:
             new_page()
 
