@@ -82,7 +82,7 @@ MIN_CHUNK_SECONDS = 90
 SUMMARY_SINGLE_PASS_CHARS = 60_000
 SUMMARY_MODEL = "google/gemini-2.5-flash-lite"
 GROQ_MODEL = "whisper-large-v3"
-TRANSCRIBE_CONCURRENCY = 3
+TRANSCRIBE_CONCURRENCY = 5
 
 ALLOWED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".m4b", ".aac", ".ogg", ".oga",
@@ -398,6 +398,7 @@ async def transcribe_chunks(
 
     sem = asyncio.Semaphore(TRANSCRIBE_CONCURRENCY)
     results: List[Optional[str]] = [None] * len(chunk_paths)
+    fatal: list = []
 
     async def _one(idx: int, path: str) -> None:
         async with sem:
@@ -413,23 +414,39 @@ async def transcribe_chunks(
                     )
                 return (transcription if isinstance(transcription, str) else getattr(transcription, "text", "")) or ""
 
-            try:
-                text = await asyncio.to_thread(_call)
-            except Exception as exc:
-                message = str(exc)
-                if "too large" in message.lower() or "80mb" in message.lower() or "25mb" in message.lower():
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Un extrait dépasse la taille max de l'API de transcription. Réessayez.",
-                    ) from exc
-                raise HTTPException(status_code=502, detail="Le service de transcription IA est momentanément indisponible.") from exc
+            # One retry per chunk: covers single-shot API/network blips without
+            # losing transcript content; a chunk that fails twice fails the job.
+            last_err: Optional[Exception] = None
+            text: Optional[str] = None
+            for attempt in (0, 1):
+                if attempt:
+                    await asyncio.sleep(2)
+                try:
+                    text = await asyncio.to_thread(_call)
+                    last_err = None
+                    break
+                except Exception as exc:
+                    message = str(exc)
+                    if "too large" in message.lower() or "payload too large" in message.lower():
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Un extrait dépasse la taille max de l'API de transcription. Réessayez.",
+                        ) from exc
+                    last_err = exc
 
-            results[idx] = text
-            done = sum(1 for r in results if r is not None)
+            if text is None:
+                fatal.append((idx, str(last_err)))
+            results[idx] = text or ""
+            done = sum(1 for r in results[: idx + 1] if r is not None)
             pct = 45 + int(40 * done / len(chunk_paths))
             progress.emit("transcribe", f"Tranche {done}/{len(chunk_paths)} transcrite", pct=pct)
 
     await asyncio.gather(*[_one(i, p) for i, p in enumerate(chunk_paths)])
+    if fatal:
+        raise HTTPException(
+            status_code=502,
+            detail="La transcription IA a échoué sur une ou plusieurs tranches. Réessayez dans un instant.",
+        )
     return [r or "" for r in results]
 
 
@@ -474,58 +491,88 @@ def summary_prompt(name: str, text: str, section_hint: str = "") -> str:
         "entre parenthèses quand utile.\n"
         "4. Termine par un tableau récapitulatif des termes clés (terme | définition).\n"
         "5. N'invente rien: si une information est absente du transcript, ne l'ajoute pas.\n"
-        "6. Longueur cible: environ 15 à 25 % du texte source (minimum ~500 mots si le "
-        "transcript est riche) pour NE PAS perdre de détails.\n\n"
+        "6. Longueur cible: environ 800 à 1200 mots — dense et enrichi, mais sans "
+        "expansion inutile: chaque phrase doit porter une information.\n\n"
         f"TRANSCRIPT:\n\n{text}"
     )
 
 
-def summarize_transcript(full_text: str, language: str, progress: ProgressReporter) -> str:
+async def summarize_transcript(full_text: str, language: str, progress: ProgressReporter) -> str:
     """
-    Whole-document summary (map-reduce only for very long transcripts) instead
+    Whole-document summary (parallel map-reduce for long transcripts) instead
     of the old per-10-minute-chunk summaries that produced disconnected minis.
+
+    Resilience: one failed slice never aborts the pipeline — failed map parts
+    are skipped (reduce works on whatever succeeded) and an empty result simply
+    ships the PDF with the full transcript, no summary section.
     """
-    if not has_openrouter_key:
+    if not has_openrouter_key or not full_text:
         return ""
 
     name = LANGUAGE_NAMES.get(language) or language
     progress.emit("summary", "Rédaction de la synthèse détaillée…", pct=88)
 
-    def _call_llm(prompt: str) -> str:
+    def _call_llm_sync(prompt: str) -> str:
         response = openrouter_client.chat.completions.create(
             model=SUMMARY_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
+            max_tokens=8192,
         )
         return (response.choices[0].message.content or "").strip()
 
+    async def _call_llm(prompt: str) -> Optional[str]:
+        try:
+            text = await asyncio.to_thread(_call_llm_sync, prompt)
+            return text or None  # guard against empty 200 bodies
+        except Exception as exc:
+            log.warning("summary LLM call failed: %s", exc)
+            return None
+
     try:
         if len(full_text) <= SUMMARY_SINGLE_PASS_CHARS:
-            return _call_llm(summary_prompt(name, full_text))
+            summary = await _call_llm(summary_prompt(name, full_text))
+            if summary:
+                return summary
+            log.warning("single-pass summary empty/failed — shipping transcript-only PDF")
+            return ""
 
-        # map-reduce: extract dense bullets per ~40k-char slice, then merge.
-        slices = []
+        # map-reduce: dense per-slice extraction in parallel, then one merge.
         step = 40_000
-        for i in range(0, len(full_text), step):
-            slices.append(full_text[i : i + step])
+        slices = [full_text[i : i + step] for i in range(0, len(full_text), step)]
+        sem = asyncio.Semaphore(3)
 
-        partials: List[str] = []
-        for i, sl in enumerate(slices):
-            partials.append(
-                _call_llm(
+        async def _map(idx: int, sl: str) -> Optional[str]:
+            async with sem:
+                return await _call_llm(
                     summary_prompt(
                         name,
                         sl,
-                        section_hint=f" (PARTIE {i + 1}/{len(slices)} du document)",
+                        section_hint=f" (PARTIE {idx + 1}/{len(slices)} du document)",
                     )
                 )
-            )
-        # reduce: merge the partial syntheses, planned redundancy kept low
-        return _call_llm(
-            f"Fusionne ces synthèses partielles en UNE synthèse détaillée UNIQUE, "
-            f"structure démonstrative en titres markdown, SANS répétitions et SANS "
-            f"perdre d'informations, en {name} uniquement:\n\n" + "\n\n---\n\n".join(partials)
+
+        partials = await asyncio.gather(*[_map(i, s) for i, s in enumerate(slices)])
+        # preserve document order; drop failed slices
+        usable = [p for p in (p for p in partials) if p]
+        if not usable:
+            progress.emit("summary", "Synthèse indisponible — transcription complète jointe", level="warning")
+            return ""
+
+        progress.emit(
+            "summary", f"{len(usable)}/{len(slices)} parties traitées — fusion finale…", pct=92
         )
+        merged = await _call_llm(
+            f"Fusionne ces synthèses partielles en UNE synthèse détaillée UNIQUE, "
+            f"structure en titres markdown, SANS répétitions et SANS perdre d'informations, "
+            f"en {name} uniquement:\n\n" + "\n\n---\n\n".join(usable)
+        )
+        if not merged:
+            # Merge failed: fall back to joining the partials verbatim —
+            # every detail survives, just less polished.
+            progress.emit("summary", "Fusion indisponible — assemblage direct des parties", level="warning")
+            return "\n\n---\n\n".join(usable)
+        return merged
     except Exception as exc:
         log.warning("summary generation failed: %s", exc)
 
@@ -756,7 +803,7 @@ async def process_audio_pipeline(
 
         summary = ""
         if summarize:
-            summary = summarize_transcript(full_text, detected_language, progress)
+            summary = await summarize_transcript(full_text, detected_language, progress)
 
         progress.emit("pdf", "Génération du PDF…", pct=95)
         cleaned_title = Path(url.split("?", 1)[0]).stem[:80] or "Transcription Audio"
@@ -860,7 +907,7 @@ async def youtube_to_pdf(
             raise HTTPException(status_code=422, detail="Aucun contenu vocal détecté dans la piste.")
 
         detected_language = (lang or "").strip().lower() or detect_language(full_text[:1500], fallback="en")
-        summary = summarize_transcript(full_text, detected_language, progress) if summarize else ""
+        summary = await summarize_transcript(full_text, detected_language, progress) if summarize else ""
         title = "Transcription YouTube"
         pdf_path, pdf_name = generate_pdf(full_text, summary, title, detected_language)
         progress.done("PDF prêt")
