@@ -582,6 +582,8 @@ async def summarize_transcript(full_text: str, language: str, progress: Progress
 # ── PDF rendering (Unicode + Arabic shaping) ─────────────────────────────────
 
 _FONT_PATTERNS = [
+    "DejaVuSans.ttf",
+    "*DejaVuSans.ttf",
     "NotoNaskhArabic-Regular.ttf",
     "*NotoNaskhArabic-Regular.ttf",
     "*Amiri-Regular.ttf",
@@ -592,7 +594,12 @@ FONT_CONF: Dict[str, Dict[str, Any]] = {}
 
 def _register_unicode_fonts() -> None:
     """Find a system Arabic-capable font (fonts-noto-core docker package)."""
-    search_roots = ["/usr/share/fonts", "/System/Library/Fonts", "C:/Windows/Fonts", "/usr/local/share/fonts"]
+    # DejaVu Sans is preferred when present: it covers BOTH full Latin and
+    # Arabic (incl. presentation forms), so mixed-language summaries (French
+    # headings + Arabic terms) render in one font. Noto Naskh Arabic (in
+    # fonts-noto-core) shows beautiful Arabic but its Latin coverage is poor
+    # (French text drew as blank dots). Amiri is a graceful last resort.
+    search_roots = ["/usr/share/fonts", "/usr/local/share/fonts", "C:/Windows/Fonts", "/System/Library/Fonts"]
     for root in search_roots:
         if not os.path.isdir(root):
             continue
@@ -752,6 +759,20 @@ def validate_url(url: str) -> Optional[str]:
     return suffix
 
 
+def _sanitize_title(raw: Optional[str], url_stem: str) -> str:
+    """Pick a human title: explicit param > URL stem; numeric/ID stems are junk."""
+    t = (raw or "").strip()
+    if t:
+        t = re.sub(r"\.(mp3|wav|m4a|ogg|oga|flac|aac|m4b|opus|webm|mp4|wma)$", "", t, flags=re.I)
+        t = re.sub(r"[_\-]+", " ", t).strip()
+        if t and len(t) <= 120:
+            return t
+    stem = (url_stem or "").strip()
+    if stem and not (stem.isdigit() and len(stem) >= 12):
+        return stem[:90]
+    return "Transcription Audio"
+
+
 def cleanup_files(paths):
     for p in paths or []:
         _silent_unlink(p)
@@ -761,6 +782,7 @@ async def process_audio_pipeline(
     url: str,
     summarize: bool,
     lang_hint: Optional[str],
+    title_hint: Optional[str],
     job: Optional[str],
     callback: Optional[str],
 ) -> Tuple[str, str, str, List[str]]:
@@ -806,7 +828,7 @@ async def process_audio_pipeline(
             summary = await summarize_transcript(full_text, detected_language, progress)
 
         progress.emit("pdf", "Génération du PDF…", pct=95)
-        cleaned_title = Path(url.split("?", 1)[0]).stem[:80] or "Transcription Audio"
+        cleaned_title = _sanitize_title(title_hint, Path(url.split("?", 1)[0]).stem)
         pdf_path, pdf_name = generate_pdf(full_text, summary, cleaned_title, detected_language)
         cleanup.append(pdf_path)
 
@@ -850,6 +872,7 @@ async def audio_to_pdf(
     url: str = "",
     summarize: bool = True,
     lang: Optional[str] = None,
+    title: Optional[str] = None,
     job: Optional[str] = None,
     callback: Optional[str] = None,
 ):
@@ -857,6 +880,7 @@ async def audio_to_pdf(
         url=url,
         summarize=summarize,
         lang_hint=lang,
+        title_hint=title,
         job=job,
         callback=callback,
     )

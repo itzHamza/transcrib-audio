@@ -6,9 +6,11 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # ffmpeg: audio decoding/normalization/segmentation
-# fonts-noto-core: Noto Naskh Arabic for Unicode PDF rendering
+# fonts-noto-core: Noto Naskh Arabic (Arabic-shaped fallback)
+# fonts-dejavu-core: DejaVu Sans — full Latin + Arabic in ONE font (mixed
+#   French/Arabic summaries render without blank-dots)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg fonts-noto-core ca-certificates && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-noto-core fonts-dejavu-core ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
