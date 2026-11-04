@@ -5,23 +5,22 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-
-# Install FFmpeg and other system dependencies
+# ffmpeg: audio decoding/normalization/segmentation
+# fonts-noto-core: Noto Naskh Arabic for Unicode PDF rendering
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-noto-core ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
-# upgrade pip and install CPU-only torch wheels directly from PyTorch index
+# NOTE: no torch / openai-whisper / pytube — local whisper was never used
+# (transcription runs on Groq), this trims the image by ~1.5 GB.
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir torch==2.5.1+cpu torchaudio==2.5.1+cpu \
-    --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt && \
     rm -rf /root/.cache/pip
 
-COPY . .
+COPY app.py .
 
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
