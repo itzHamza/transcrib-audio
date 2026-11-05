@@ -1,2 +1,3 @@
 /__pycache__/
-.envyt_cookies.txt
+.env
+/out/
