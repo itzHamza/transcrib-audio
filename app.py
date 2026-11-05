@@ -1051,28 +1051,80 @@ def _yt_fetch_subtitles(url: str, out_dir: str) -> List[Path]:
         "--sub-format", "vtt/srt/best",
         "--no-playlist", "--no-warnings", "--quiet",
         "-o", str(Path(out_dir) / "yt.%(ext)s"),
+        *_YT_GLOBAL_ARGS,
         url,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-    return sorted(
+    files = sorted(
         list(Path(out_dir).glob("yt.*.vtt")) + list(Path(out_dir).glob("yt.*.srt"))
     )
+    if not files:
+        # Surface WHY YouTube gave nothing (bot-check, unavailable video…)
+        stderr_tail = (proc.stderr or "").strip()[-400:]
+        if stderr_tail:
+            log.warning("[yt] subtitles fetch found nothing: %s", stderr_tail)
+    return files
 
 
 def _yt_fetch_title(url: str) -> Optional[str]:
     try:
         proc = subprocess.run(
             ["yt-dlp", "--skip-download", "--no-playlist", "--no-warnings",
-             "--quiet", "--print", "%(title)s", url],
+             "--quiet", "--print", "%(title)s", *_YT_GLOBAL_ARGS, url],
             capture_output=True, text=True, timeout=90,
         )
         if proc.returncode == 0:
             first = (proc.stdout or "").strip().splitlines()
             if first and first[0].strip():
                 return first[0].strip()[:120]
+        else:
+            log.warning("[yt] title fetch rc=%s: %s", proc.returncode, (proc.stderr or "")[-200:])
     except Exception as exc:
         log.warning("yt title fetch failed: %s", exc)
     return None
+
+
+def _yt_cookie_args() -> List[str]:
+    """Optional YouTube cookies (datacenter-IP bot-check workaround).
+
+    Set either YOUTUBE_COOKIES_FILE=/path/cookies.txt (Netscape format) or
+    YOUTUBE_COOKIES=<raw Netscape content> in the container env.
+    """
+    path = os.getenv("YOUTUBE_COOKIES_FILE")
+    if path and os.path.isfile(path):
+        return ["--cookies", path]
+    raw = os.getenv("YOUTUBE_COOKIES")
+    if raw:
+        tmp = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+        try:
+            tmp.write_text(raw, encoding="utf-8")
+            return ["--cookies", str(tmp)]
+        except OSError as exc:
+            log.warning("could not write YOUTUBE_COOKIES temp file: %s", exc)
+    return []
+
+
+def _yt_stderr_hint(stderr: str) -> Optional[str]:
+    """Friendly French hint when YouTube rejects the request."""
+    s = (stderr or "").lower()
+    if "sign in to confirm" in s or "not a bot" in s or "confirm you are not a bot" in s or "cookies" in s and "age" in s:
+        return (
+            "YouTube bloque les requêtes depuis cette IP (anti-bot). "
+            "Ajoutez un cookie exporté (YOUTUBE_COOKIES_FILE au format Netscape) puis reconstruisez l'image."
+        )
+    if "403" in s or "banned" in s or "temporarily unavailable" in s:
+        return "Accès YouTube refusé temporairement depuis l'IP du serveur."
+    return None
+
+
+_YT_GLOBAL_ARGS: List[str] = []  # populated at startup (cookies)
+
+
+@app.on_event("startup")
+def _init_yt_args() -> None:
+    _YT_GLOBAL_ARGS.extend(_yt_cookie_args())
+    if _YT_GLOBAL_ARGS:
+        log.info("yt-dlp cookies enabled")
 
 
 @app.get("/youtube-to-pdf")
@@ -1097,10 +1149,17 @@ async def youtube_to_pdf(
             "--no-playlist", "--no-progress",
             "-o", template, url,
             "--max-filesize", str(MAX_FILE_SIZE),
+            *_YT_GLOBAL_ARGS,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            raise HTTPException(status_code=502, detail="Impossible de télécharger la piste YouTube.")
+            stderr_tail = (proc.stderr or "").strip()[-400:]
+            log.warning("[yt] audio download failed rc=%s: %s", proc.returncode, stderr_tail)
+            hint = _yt_stderr_hint(stderr_tail)
+            detail = "Impossible de télécharger la piste YouTube."
+            if hint:
+                detail = f"{detail} — {hint}"
+            raise HTTPException(status_code=502, detail=detail)
         files = sorted(Path(out_dir).glob("yt.*"))
         if not files:
             raise HTTPException(status_code=502, detail="Aucune piste audio récupérée depuis YouTube.")
