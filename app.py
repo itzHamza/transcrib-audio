@@ -1067,6 +1067,7 @@ def _yt_fetch_subtitles(url: str, out_dir: str) -> List[Path]:
 
 
 def _yt_fetch_title(url: str) -> Optional[str]:
+    """Metadata-only title lookup (fast single yt-dlp pass)."""
     try:
         proc = subprocess.run(
             ["yt-dlp", "--skip-download", "--no-playlist", "--no-warnings",
@@ -1082,6 +1083,34 @@ def _yt_fetch_title(url: str) -> Optional[str]:
     except Exception as exc:
         log.warning("yt title fetch failed: %s", exc)
     return None
+
+
+@app.get("/youtube-title")
+async def youtube_title(url: str = ""):
+    """Video title lookup for the AI dialog's title prefill."""
+    params_url = (url or "").strip()
+    try:
+        from urllib.parse import parse_qs, urlparse
+
+        p = urlparse(params_url)
+        v = ""
+        if "youtu.be" in p.netloc.lower():
+            v = p.path.strip("/").split("/")[0]
+        elif "youtube.com" in p.netloc.lower():
+            v = (parse_qs(p.query).get("v") or [None])[0] or ""
+            if not v and "/shorts/" in p.path:
+                v = p.path.split("/shorts/")[1].split("/")[0]
+        if not v or len(v) != 11:
+            raise HTTPException(status_code=400, detail="Lien YouTube invalide.")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Lien YouTube invalide.")
+
+    title = await asyncio.to_thread(_yt_fetch_title, params_url)
+    if not title:
+        raise HTTPException(status_code=504, detail="Titre de la vidéo indisponible pour le moment.")
+    return {"url": params_url, "title": title}
 
 
 def _yt_cookie_args() -> List[str]:
