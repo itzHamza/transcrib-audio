@@ -10,9 +10,19 @@ WORKDIR /app
 # fonts-dejavu-core: DejaVu Sans — full Latin + Arabic in ONE font (mixed
 #   French/Arabic summaries render without blank-dots)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg fonts-noto-core fonts-dejavu-core ca-certificates && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-noto-core fonts-dejavu-core ca-certificates curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Deno JS runtime — yt-dlp's YouTube n-challenge solver probes deno by
+# default; without it only storyboard images are extractable on logged-in
+# @SBI-protected pages.
+RUN curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip \
+        -o /tmp/deno.zip && \
+    python -c "import zipfile; zipfile.ZipFile('/tmp/deno.zip').extract('deno', '/usr/local/bin/')" && \
+    chmod +x /usr/local/bin/deno && \
+    rm -f /tmp/deno.zip && \
+    /usr/local/bin/deno --version
 
 COPY requirements.txt .
 
