@@ -587,6 +587,11 @@ _FONT_PATTERNS = [
     "NotoNaskhArabic-Regular.ttf",
     "*NotoNaskhArabic-Regular.ttf",
     "*Amiri-Regular.ttf",
+    # Windows-only candidates so LOCAL testing shapes Arabic the same way the
+    # Linux container does (these files carry Arabic in local builds only).
+    "arial.ttf",
+    "tahoma.ttf",
+    "segoeui.ttf",
 ]
 
 FONT_CONF: Dict[str, Dict[str, Any]] = {}
@@ -619,6 +624,8 @@ def _register_unicode_fonts() -> None:
                     bold_candidates = [
                         str(Path(font_path).with_name(Path(font_path).stem + "-Bold.ttf")),
                         str(Path(font_path).with_name(Path(font_path).stem.replace("Sans", "Sans-Bold") + ".ttf")),
+                        # Windows naming: arial.ttf → arialbd.ttf
+                        str(Path(font_path).with_name(Path(font_path).stem[:-2] + "bd.ttf")),
                     ]
                     for bold_path in bold_candidates:
                         if os.path.isfile(bold_path):
@@ -656,21 +663,23 @@ def _wrap_lines(
     font_name: str,
     font_size: int,
     max_width: float,
+    x_offset: float = 0.0,
 ) -> List[str]:
     """Greedy word wrap that splits at the measured character level at most."""
     out: List[str] = []
+    usable_width = max_width - x_offset
     for paragraph in text.split("\n"):
         words = _shape_text(paragraph).split(" ")
         current = ""
         for word in words:
             candidate = f"{current} {word}".strip() if current else word
-            if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+            if pdfmetrics.stringWidth(candidate, font_name, font_size) <= usable_width:
                 current = candidate
                 continue
             if current:
                 out.append(current)
             # Very long words (URLs / shaped runs) get hard-split
-            while pdfmetrics.stringWidth(word, font_name, font_size) > max_width and word:
+            while pdfmetrics.stringWidth(word, font_name, font_size) > usable_width and word:
                 # binary-ish search for max prefix that fits
                 lo, hi = 1, len(word)
                 best = 1
@@ -767,15 +776,15 @@ def generate_pdf(
 
     y = top
 
-    def draw_wrapped(text: str, size: int = 11, gap_after: int = 6, font: Optional[str] = None) -> None:
+    def draw_wrapped(text: str, size: int = 11, gap_after: int = 6, font: Optional[str] = None, x_offset: float = 0.0) -> None:
         nonlocal y
         f = font or font_name
-        for line in _wrap_lines(text, f, size, max_text_width):
+        for line in _wrap_lines(text, f, size, max_text_width, x_offset=x_offset):
             if y < 20 * mm:
                 new_page()
                 y = top
             c.setFont(f, size)
-            c.drawString(left, y, line)
+            c.drawString(left + x_offset, y, line)
             y -= (size * 1.45)
         y -= gap_after
 
@@ -819,6 +828,16 @@ def generate_pdf(
                 c.drawString(left, y, display)
                 y -= 12 * 1.5
                 y -= 2
+                continue
+            if s.startswith("• "):
+                # Deterministic bullets: drawn at a fixed column, text indented
+                # (bidi reordering would otherwise float the bullet).
+                if y < 25 * mm:
+                    new_page()
+                    y = top
+                c.setFont(font_name, 11)
+                c.drawString(left + 2, y, "•")
+                draw_wrapped(s[2:], size=11, gap_after=2, x_offset=14)
                 continue
             draw_wrapped(s, size=11, gap_after=2)
         if y < 60 * mm:
@@ -978,16 +997,98 @@ async def audio_to_pdf(
     return FileResponse(path=pdf_path, filename=pdf_name, media_type="application/pdf")
 
 
+_VTT_META_RE = re.compile(r"^(WEBVTT|Kind:|Language:|NOTE|Identifier:|Style:)")
+_SRT_INDEX_RE = re.compile(r"^\d+$")
+_VTT_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _vtt_or_srt_to_text(path: Path) -> str:
+    """Subtitle file → plain text (cue numbers/timestamps removed, rolling
+    caption repetitions deduplicated)."""
+    lines: List[str] = []
+    prev: Optional[str] = None
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    for raw in content.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if _VTT_META_RE.match(s) or _SRT_INDEX_RE.match(s):
+            continue
+        if "-->" in s:
+            continue
+        if "<" in s:
+            s = _VTT_TAG_RE.sub("", s).strip()
+        if not s:
+            continue
+        if prev is not None and s == prev:
+            continue
+        prev = s
+        lines.append(s)
+    return "\n".join(lines).strip()
+
+
+def _yt_sub_lang_rank(filename: str) -> int:
+    """Candidates order: Arabic originals → French → English → anything."""
+    name = filename.lower()
+    if ".ar" in name:
+        return 0
+    if ".fr" in name:
+        return 1
+    if ".en" in name:
+        return 2
+    return 3
+
+
+def _yt_fetch_subtitles(url: str, out_dir: str) -> List[Path]:
+    """Manual subs first, then auto-generated ones (ar → fr → en preference)."""
+    cmd = [
+        "yt-dlp", "--skip-download",
+        "--write-subs", "--write-auto-subs",
+        "--sub-langs", "ar.*,fr.*,en.*",
+        "--sub-format", "vtt/srt/best",
+        "--no-playlist", "--no-warnings", "--quiet",
+        "-o", str(Path(out_dir) / "yt.%(ext)s"),
+        url,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    return sorted(
+        list(Path(out_dir).glob("yt.*.vtt")) + list(Path(out_dir).glob("yt.*.srt"))
+    )
+
+
+def _yt_fetch_title(url: str) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            ["yt-dlp", "--skip-download", "--no-playlist", "--no-warnings",
+             "--quiet", "--print", "%(title)s", url],
+            capture_output=True, text=True, timeout=90,
+        )
+        if proc.returncode == 0:
+            first = (proc.stdout or "").strip().splitlines()
+            if first and first[0].strip():
+                return first[0].strip()[:120]
+    except Exception as exc:
+        log.warning("yt title fetch failed: %s", exc)
+    return None
+
+
 @app.get("/youtube-to-pdf")
 async def youtube_to_pdf(
     background_tasks: BackgroundTasks,
     url: str = "",
     summarize: bool = True,
     lang: Optional[str] = None,
+    title: Optional[str] = None,
     job: Optional[str] = None,
+    callback: Optional[str] = None,
 ):
-    progress = ProgressReporter(job, None)
+    progress = ProgressReporter(job, callback)
     progress.engage()
+    started = time.time()
+
     def _yt_download() -> Tuple[str, Dict[str, Any]]:
         out_dir = tempfile.mkdtemp(prefix="yt_")
         template = str(Path(out_dir) / "yt.%(ext)s")
@@ -1006,30 +1107,73 @@ async def youtube_to_pdf(
         return str(files[0]), {"out_dir": out_dir}
 
     try:
-        tmp_path, meta = await asyncio.to_thread(_yt_download)
-    except HTTPException:
-        raise
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(status_code=504, detail="Téléchargement YouTube trop lent (timeout).") from exc
+        # ── Fast path: subtitles (perfect quality, no IA cost) ─────────────────
+        progress.emit("subtitles", "Recherche de sous-titres YouTube…", pct=10)
+        subs_dir = tempfile.mkdtemp(prefix="yt_subs_")
+        candidates = await asyncio.to_thread(_yt_fetch_subtitles, url, subs_dir)
+        cleanup: List[str] = [str(p) for p in Path(subs_dir).glob("*")]
 
-    try:
-        info = probe_audio(tmp_path)
-        chunk_paths = await chunk_audio(tmp_path, info, progress)
-        texts = await transcribe_chunks(chunk_paths, progress)
-        full_text = "\n\n".join(t for t in texts if t).strip()
-        if not full_text:
-            raise HTTPException(status_code=422, detail="Aucun contenu vocal détecté dans la piste.")
+        best_text = ""
+        best_lang_tag = ""
+        for f in sorted(candidates, key=lambda p: _yt_sub_lang_rank(p.name)):
+            text = _vtt_or_srt_to_text(f)
+            if len(text) >= 200:  # below that, captions are considered useless
+                best_text = text
+                parts = f.stem.split(".")
+                best_lang_tag = parts[1] if len(parts) > 1 else "auto"
+                break
+
+        if best_text:
+            full_text = best_text
+            progress.emit(
+                "subtitles",
+                f"Sous-titres ({best_lang_tag}) utilisés — pas de transcription IA nécessaire",
+                pct=85,
+            )
+            log.info("[yt] subtitles used: %s (%d chars)", best_lang_tag, len(full_text))
+        else:
+            # ── Fallback: same audio pipeline as local uploads ──────────────────
+            progress.emit("download", "Aucun sous-titre exploitable — téléchargement de la piste audio…", pct=15)
+            tmp_path, meta = await asyncio.to_thread(_yt_download)
+            out_dir = meta.get("out_dir")
+            if out_dir:
+                cleanup.extend(str(p) for p in Path(out_dir).glob("*"))
+            cleanup.append(tmp_path)
+
+            progress.emit("probe", "Analyse du fichier…", pct=22)
+            info = probe_audio(tmp_path)
+            chunk_paths = await chunk_audio(tmp_path, info, progress)
+            cleanup.extend(p for p in chunk_paths if p not in cleanup)
+
+            texts = await transcribe_chunks(chunk_paths, progress)
+            full_text = "\n\n".join(t for t in texts if t).strip()
+            if not full_text:
+                raise HTTPException(status_code=422, detail="Aucun contenu vocal détecté dans la piste.")
 
         detected_language = (lang or "").strip().lower() or detect_language(full_text[:1500], fallback="en")
-        summary = await summarize_transcript(full_text, detected_language, progress) if summarize else ""
-        title = "Transcription YouTube"
-        pdf_path, pdf_name = generate_pdf(full_text, summary, title, detected_language)
-        progress.done("PDF prêt")
+        if best_text:
+            # Subtitles are already clean, human-written/generated text — the
+            # LLM synthesis adds nothing except latency and cost: skip it.
+            progress.emit("subtitles", "Sous-titres exploités — synthèse IA ignorée", pct=88)
+            summary = ""
+        else:
+            summary = await summarize_transcript(full_text, detected_language, progress) if summarize else ""
 
-        cleanup = [tmp_path, pdf_path]
-        out_dir = meta.get("out_dir")
-        if out_dir:
-            cleanup.extend(str(p) for p in Path(out_dir).glob("*"))
+        pdf_title = (title or "").strip() or await asyncio.to_thread(_yt_fetch_title, url) or "Transcription YouTube"
+        progress.emit("pdf", "Génération du PDF…", pct=95)
+        safe_title = _sanitize_title(pdf_title, "") or "Transcription YouTube"
+        pdf_path, pdf_name = generate_pdf(full_text, summary, safe_title, detected_language)
+        cleanup.append(pdf_path)
+
+        progress.done("PDF prêt")
+        log.info(
+            "yt job done in %.1fs | source=%s | lang=%s | summary=%s | %d chars",
+            time.time() - started, "subtitles" if best_text else "audio",
+            detected_language, bool(summary), len(full_text),
+        )
+
+        background_tasks.add_task(cleanup_files, cleanup)
+        return FileResponse(path=pdf_path, filename=pdf_name, media_type="application/pdf")
     except HTTPException as he:
         progress.failed(str(he.detail))
         raise
@@ -1037,9 +1181,6 @@ async def youtube_to_pdf(
         progress.failed("Erreur interne du service audio.")
         log.exception("youtube pipeline failure")
         raise HTTPException(status_code=500, detail="Erreur interne du service audio.") from exc
-
-    background_tasks.add_task(cleanup_files, cleanup)
-    return FileResponse(path=pdf_path, filename=pdf_name, media_type="application/pdf")
 
 
 if __name__ == "__main__":
