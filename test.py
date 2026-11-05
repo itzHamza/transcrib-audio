@@ -59,6 +59,11 @@ subprocess.run = _run_shim
 
 import app  # noqa: E402  (registers fonts + logging config)
 
+# Same cookie injection the production service performs at FastAPI startup.
+app._YT_GLOBAL_ARGS.extend(app._yt_cookie_args())
+if app._YT_GLOBAL_ARGS:
+    print("[env] yt-dlp cookies enabled")
+
 # ── 3. CLI args
 args = [a for a in sys.argv[1:]]
 url = next((a for a in args if not a.startswith("--")), DEFAULT_URL)
@@ -145,7 +150,7 @@ async def main() -> None:
     pdf_path, _pdf_name = app.generate_pdf(full_text, summary, safe_title, detected)
 
     clean = re.sub(r'[<>:"/\\|?*]', "", safe_title)[:60] or "yt-test"
-    dest = OUT / f"{clean}.pdf"
+    dest = OUT / f"{clean}-{time.strftime('%H%M%S')}.pdf"
     shutil.copyfile(pdf_path, dest)
 
     minutes_total = (time.time() - t0) / 60
