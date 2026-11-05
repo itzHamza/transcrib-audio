@@ -1123,8 +1123,19 @@ _YT_GLOBAL_ARGS: List[str] = []  # populated at startup (cookies)
 @app.on_event("startup")
 def _init_yt_args() -> None:
     _YT_GLOBAL_ARGS.extend(_yt_cookie_args())
+    env_file = os.getenv("YOUTUBE_COOKIES_FILE")
+    raw = os.getenv("YOUTUBE_COOKIES")
     if _YT_GLOBAL_ARGS:
-        log.info("yt-dlp cookies enabled")
+        log.info("[startup] yt-dlp cookies enabled via %s", _YT_GLOBAL_ARGS[-1])
+    elif env_file:
+        log.warning(
+            "[startup] YOUTUBE_COOKIES_FILE set to %r but the file was not found inside the container — cookies DISABLED",
+            env_file,
+        )
+    elif raw:
+        log.warning("[startup] YOUTUBE_COOKIES set but could not be written to temp file — cookies DISABLED")
+    else:
+        log.info("[startup] no YouTube cookies configured")
 
 
 @app.get("/youtube-to-pdf")
