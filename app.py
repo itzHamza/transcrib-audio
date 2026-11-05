@@ -1088,13 +1088,31 @@ def _yt_cookie_args() -> List[str]:
     """Optional YouTube cookies (datacenter-IP bot-check workaround).
 
     Set either YOUTUBE_COOKIES_FILE=/path/cookies.txt (Netscape format) or
-    YOUTUBE_COOKIES=<raw Netscape content> in the container env.
+    YOUTUBE_COOKIES with the cookies content:
+      - a normal multiline Netscape paste, or
+      - a ONE-LINE base64 encoding of the cookies file (recommended — immune
+        to env panels that mangle newlines). Auto-detected: any value that
+        does not start with "#" is treated as base64 and decoded.
     """
     path = os.getenv("YOUTUBE_COOKIES_FILE")
     if path and os.path.isfile(path):
         return ["--cookies", path]
     raw = os.getenv("YOUTUBE_COOKIES")
     if raw:
+        if not raw.lstrip().startswith("#"):
+            try:
+                import base64
+
+                decoded = base64.b64decode(
+                    re.sub(r"\s+", "", raw), validate=True
+                ).decode("utf-8")
+                if decoded.lstrip().startswith("#"):
+                    raw = decoded
+                # else: keep the raw value — yt-dlp will error visibly and the
+                # stderr tail will show the parse problem.
+            except Exception:
+                # Not valid base64 — fall through with the raw value.
+                pass
         tmp = Path(tempfile.gettempdir()) / "yt_cookies.txt"
         try:
             tmp.write_text(raw, encoding="utf-8")
